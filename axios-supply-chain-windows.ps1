@@ -102,12 +102,45 @@ if (-not (Test-Path $sshDir)) {
     Write-Status -Action "SSH Directory Prep" -Status "SUCCESS" -Detail "Directory exists: $sshDir"
 }
 
+$sshKeygenPath = @(
+    "$env:SystemRoot\System32\OpenSSH\ssh-keygen.exe",
+    "$env:ProgramFiles\OpenSSH\ssh-keygen.exe",
+    "$env:ProgramFiles\Git\usr\bin\ssh-keygen.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if (-not $sshKeygenPath) {
+    $found = Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    if ($found) { $sshKeygenPath = $found.Source }
+}
+
 if (-not (Test-Path $privKey) -or -not (Test-Path $pubKey)) {
-    try {
-        ssh-keygen -t rsa -b 2048 -f $privKey -N '""' -q
-        Write-Status -Action "SSH Key Generation" -Status "SUCCESS" -Detail "Generated RSA key pair in $sshDir"
-    } catch {
-        Write-Status -Action "SSH Key Generation" -Status "FAILED" -Detail $_.Exception.Message
+    if ($sshKeygenPath) {
+        try {
+            & $sshKeygenPath -t rsa -b 2048 -f $privKey -N '""' -q
+            Write-Status -Action "SSH Key Generation" -Status "SUCCESS" -Detail "Generated RSA key pair via ssh-keygen in $sshDir"
+        } catch {
+            Write-Status -Action "SSH Key Generation" -Status "FAILED" -Detail $_.Exception.Message
+        }
+    } else {
+        try {
+            $keygenScript = Join-Path $env:TEMP "keygen.js"
+            $keygenCode = @"
+const { generateKeyPairSync } = require('crypto');
+const fs = require('fs');
+const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' }
+});
+fs.writeFileSync(process.argv[2], privateKey);
+fs.writeFileSync(process.argv[3], publicKey);
+"@
+            Set-Content -Path $keygenScript -Value $keygenCode -Force
+            node $keygenScript $privKey $pubKey
+            Write-Status -Action "SSH Key Generation" -Status "SUCCESS" -Detail "Generated RSA key pair via Node.js in $sshDir"
+        } catch {
+            Write-Status -Action "SSH Key Generation" -Status "FAILED" -Detail $_.Exception.Message
+        }
     }
 } else {
     Write-Status -Action "SSH Key Generation" -Status "SUCCESS" -Detail "RSA key pair present in $sshDir"
@@ -204,7 +237,7 @@ const req = http.request({
 });
 
 req.on('error', e => {
-    if (e.code !== 'ECONNRESET') {
+    if (e.code !== 'ECONNRESET' && e.code !== 'ETIMEDOUT') {
         console.error("ERROR: " + e.message);
     }
 });

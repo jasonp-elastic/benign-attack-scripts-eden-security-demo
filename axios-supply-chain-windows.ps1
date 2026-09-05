@@ -4,17 +4,22 @@
 #
 # Purpose:
 #   Simulates the forensic artifacts of an Axios supply chain attack in a
-#   live host environment. Run this script on the Windows demo host to:
+#   live host environment. Run this script on the Windows demo host to
+#   generate the following artifacts and behaviors:
 #
-#     1. Build attacker-style artifacts on the local Windows host (registry
-#        persistence, binary masquerade, staged payload, SSH keys).
-#     2. Send an outbound signal mimicking C2 check-in behavior (targeting
-#        192.0.2.1, an IANA-reserved documentation address).
-#     3. Open an Elastic Security case in Kibana to drive the
-#        investigation portion of the demo.
+#     1. Terminate any lingering node, wt, or ssh processes from prior runs.
+#     2. Ensure OpenSSH client and Node.js are installed.
+#     3. Generate an RSA SSH key pair and known_hosts file under ~/.ssh.
+#     4. Copy powershell.exe to C:\ProgramData\wt.exe (binary masquerade).
+#     5. Via a scheduled task, run node.exe which launches wt.exe, which:
+#          a. Sets a registry Run key for persistence (MicrosoftUpdate).
+#          b. Drops a staged payload file at C:\TEMP\stage2.ps1.
+#          c. Spawns ssh.exe targeting 192.0.2.1 (lateral movement simulation).
+#     6. Send an outbound HTTP POST to 192.0.2.1:8000 via Node.js (C2 beacon).
 #
-#   The Windows host should have Elastic Agent with Elastic Defend in detect mode, simulated activity
-#   is visible in the Elastic Security console for live detection demos.
+#   All activity is benign. The Windows host should have Elastic Agent with
+#   Elastic Defend in Detect mode -- simulated activity is visible in the
+#   Elastic Security console for live detection demos.
 #
 # Prerequisites:
 #   - One demo host (Windows) attached to a live Elastic Security cluster. 
@@ -27,8 +32,6 @@
 #
 # ==============================================================================
 
-# Force TLS 1.2 for Elastic Cloud API communication
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Write-Status {
     param (

